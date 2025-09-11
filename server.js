@@ -633,7 +633,7 @@ app.get('/api/report/:code', async (req, res) => {
       return res.status(404).json({ error: 'Report not found' });
     }
 
-    res.json({
+    res.status(200).json({
       success: true,
       report: report.report_data
     });
