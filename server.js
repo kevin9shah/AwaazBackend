@@ -53,7 +53,7 @@ const supabase = createClient(
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
 
 // Generate 5-digit unique code
 function generateUniqueCode() {
@@ -371,28 +371,18 @@ app.get('/api/presentation/:code', async (req, res) => {
       return res.status(404).json({ error: 'Presentation not found' });
     }
 
-    // Get URLs for slides if images exist
+    // Get signed URLs for slides if images exist
     const slideUrls = {};
     if (presentation.has_images) {
       for (let i = 1; i <= presentation.slide_count; i++) {
         const fileName = `${code}/slide_${i}.png`;
         
-        // Try to get public URL first (for public bucket)
-        const publicUrl = getPublicImageUrl(fileName);
+        const { data: signedUrl } = await supabase.storage
+          .from('presentation-slides')
+          .createSignedUrl(fileName, 3600); // 1 hour expiry
         
-        if (publicUrl) {
-          slideUrls[i] = publicUrl;
-          console.log(`Using public URL for ${fileName}: ${publicUrl}`);
-        } else {
-          // Fallback to signed URL
-          const { data: signedUrl } = await supabase.storage
-            .from('presentation-slides')
-            .createSignedUrl(fileName, 3600); // 1 hour expiry
-          
-          if (signedUrl) {
-            slideUrls[i] = signedUrl.signedUrl;
-            console.log(`Using signed URL for ${fileName}`);
-          }
+        if (signedUrl) {
+          slideUrls[i] = signedUrl.signedUrl;
         }
       }
     }
@@ -444,33 +434,6 @@ app.post('/api/setup-database', async (req, res) => {
     console.error('Database setup error:', error);
     res.status(500).json({
       error: 'Failed to setup database',
-      details: error.message
-    });
-  }
-});
-
-// Check storage bucket status
-app.get('/api/storage/status', async (req, res) => {
-  try {
-    const { data: buckets, error } = await supabase.storage.listBuckets();
-    
-    if (error) {
-      throw error;
-    }
-    
-    const presentationBucket = buckets.find(bucket => bucket.name === 'presentation-slides');
-    
-    res.json({
-      success: true,
-      bucketExists: !!presentationBucket,
-      bucketPublic: presentationBucket?.public || false,
-      allBuckets: buckets.map(b => ({ name: b.name, public: b.public }))
-    });
-    
-  } catch (error) {
-    console.error('Storage status error:', error);
-    res.status(500).json({
-      error: 'Failed to check storage status',
       details: error.message
     });
   }
