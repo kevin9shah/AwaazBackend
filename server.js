@@ -18,6 +18,7 @@ const corsOptions = {
     'http://localhost:3001', 
     'http://localhost:5173',  // Vite dev server
     'http://localhost:5174',  // Alternative Vite port
+    'http://localhost:5175',  // Alternative Vite port
     'http://127.0.0.1:3000',
     'http://127.0.0.1:5173'
   ],
