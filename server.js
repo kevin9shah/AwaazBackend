@@ -439,6 +439,213 @@ app.post('/api/setup-database', async (req, res) => {
   }
 });
 
+// Add this to your server.js file
+
+// Generate report using AI analysis
+async function generateReport(qaPairs) {
+  const results = [];
+  
+  for (const { question, userAnswer } of qaPairs) {
+    try {
+      const evaluation = await evaluateAnswerWithGemini(question, userAnswer);
+      
+      results.push({
+        "Question": question,
+        "User Answer": userAnswer,
+        "Reference Answer": evaluation.referenceAnswer,
+        "Similarity Score": evaluation.similarity,
+        "Missing Points": evaluation.missingPoints
+      });
+    } catch (error) {
+      console.error(`Error evaluating question: ${question}`, error);
+      // Add a fallback result for failed evaluations
+      results.push({
+        "Question": question,
+        "User Answer": userAnswer,
+        "Reference Answer": "Unable to generate reference answer",
+        "Similarity Score": 0,
+        "Missing Points": "Evaluation failed"
+      });
+    }
+  }
+  
+  return results;
+}
+
+// Evaluate answer using Gemini AI
+async function evaluateAnswerWithGemini(question, userAnswer) {
+  try {
+    const prompt = `
+    Evaluate the following question and answer pair:
+    
+    Question: "${question}"
+    User Answer: "${userAnswer}"
+    
+    Please provide:
+    1. A comprehensive reference answer (2-3 sentences)
+    2. A similarity score between 0-100 (how well the user answer matches the ideal answer)
+    3. Missing key points from the user's answer
+    
+    Respond in this exact JSON format:
+    {
+      "referenceAnswer": "Your ideal answer here",
+      "similarity": 85,
+      "missingPoints": "Key points the user missed"
+    }`;
+
+    const result = await model.generateContent(prompt);
+    const response = await result.response;
+    const responseText = response.text().trim();
+    
+    // Try to parse the JSON response
+    try {
+      const parsed = JSON.parse(responseText);
+      return {
+        referenceAnswer: parsed.referenceAnswer || "No reference answer generated",
+        similarity: parsed.similarity || 0,
+        missingPoints: parsed.missingPoints || "No missing points identified"
+      };
+    } catch (parseError) {
+      // Fallback if JSON parsing fails
+      return {
+        referenceAnswer: "Unable to parse AI response",
+        similarity: 0,
+        missingPoints: "Response parsing failed"
+      };
+    }
+    
+  } catch (error) {
+    console.error('Gemini API Error in evaluation:', error);
+    throw error;
+  }
+}
+
+// Generate report and save to database
+app.post('/api/generate-report', async (req, res) => {
+  try {
+    // Validate request body
+    const { qaPairs, title } = req.body;
+    
+    if (!qaPairs || !Array.isArray(qaPairs)) {
+      return res.status(400).json({ 
+        error: 'qaPairs must be an array',
+        example: {
+          qaPairs: [
+            {
+              question: "What is cloud computing?",
+              userAnswer: "Cloud computing is delivery of computing services over the internet"
+            }
+          ],
+          title: "Interview Report" // optional
+        }
+      });
+    }
+
+    // Validate each QA pair
+    for (let i = 0; i < qaPairs.length; i++) {
+      const pair = qaPairs[i];
+      if (!pair.question || !pair.userAnswer) {
+        return res.status(400).json({ 
+          error: `QA pair at index ${i} must have both 'question' and 'userAnswer' fields` 
+        });
+      }
+    }
+
+    console.log(`Starting report generation for ${qaPairs.length} QA pairs...`);
+
+    // Generate unique 5-digit code for the report
+    const uniqueCode = generateUniqueCode();
+    
+    // Generate the report using AI
+    const reportData = await generateReport(qaPairs);
+    
+    // Calculate overall statistics
+    const totalQuestions = reportData.length;
+    const averageScore = reportData.reduce((sum, item) => sum + item["Similarity Score"], 0) / totalQuestions;
+    const passedQuestions = reportData.filter(item => item["Similarity Score"] >= 70).length;
+    
+    // Create the final report object
+    const finalReport = {
+      code: uniqueCode,
+      title: title || `Interview Report - ${new Date().toLocaleDateString()}`,
+      generatedAt: new Date().toISOString(),
+      summary: {
+        totalQuestions: totalQuestions,
+        averageScore: Math.round(averageScore * 100) / 100,
+        passedQuestions: passedQuestions,
+        passRate: Math.round((passedQuestions / totalQuestions) * 100)
+      },
+      evaluations: reportData
+    };
+
+    // Store in database (you'll need to create a 'reports' table)
+    const { error: dbError } = await supabase
+      .from('reports')
+      .insert({
+        unique_code: uniqueCode,
+        title: finalReport.title,
+        total_questions: totalQuestions,
+        average_score: averageScore,
+        pass_rate: Math.round((passedQuestions / totalQuestions) * 100),
+        report_data: finalReport,
+        created_at: new Date().toISOString()
+      });
+
+    if (dbError) {
+      throw new Error(`Database error: ${dbError.message}`);
+    }
+
+    console.log(`Report generated successfully with code: ${uniqueCode}`);
+
+    // Return the response
+    res.json({
+      success: true,
+      code: uniqueCode,
+      message: 'Report generated successfully',
+      summary: finalReport.summary,
+      report: finalReport
+    });
+
+  } catch (error) {
+    console.error('Report generation error:', error);
+    res.status(500).json({
+      success: false,
+      error: 'Failed to generate report',
+      details: error.message
+    });
+  }
+});
+
+// Get report by code
+app.get('/api/report/:code', async (req, res) => {
+  try {
+    const { code } = req.params;
+    
+    // Fetch report from database
+    const { data: report, error } = await supabase
+      .from('reports')
+      .select('*')
+      .eq('unique_code', code)
+      .single();
+
+    if (error || !report) {
+      return res.status(404).json({ error: 'Report not found' });
+    }
+
+    res.json({
+      success: true,
+      report: report.report_data
+    });
+
+  } catch (error) {
+    console.error('Fetch report error:', error);
+    res.status(500).json({ 
+      error: 'Failed to fetch report',
+      details: error.message 
+    });
+  }
+});
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);

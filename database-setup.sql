@@ -12,6 +12,28 @@ CREATE TABLE presentations (
     created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
     updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+-- Add this to your database-setup.sql file
+
+-- Create reports table
+CREATE TABLE reports (
+    id UUID DEFAULT gen_random_uuid() PRIMARY KEY,
+    unique_code VARCHAR(5) UNIQUE NOT NULL,
+    title VARCHAR(255) NOT NULL,
+    total_questions INTEGER NOT NULL DEFAULT 0,
+    average_score DECIMAL(5,2) DEFAULT 0,
+    pass_rate INTEGER DEFAULT 0,
+    report_data JSONB NOT NULL,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Create indexes for better performance
+CREATE INDEX idx_reports_unique_code ON reports(unique_code);
+CREATE INDEX idx_reports_created_at ON reports(created_at DESC);
+
+-- Create trigger for automatic timestamp updates
+CREATE TRIGGER update_reports_updated_at BEFORE UPDATE ON reports
+    FOR EACH ROW EXECUTE PROCEDURE update_updated_at_column();
 
 -- Create storage bucket for presentation slides
 INSERT INTO storage.buckets (id, name, public) VALUES ('presentation-slides', 'presentation-slides', true);
