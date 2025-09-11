@@ -3,3 +3,6 @@ node_modules/
 temp/
 *.tmp
 *.log
+pdf_pages/
+doc.pdf
+eng.trained_data

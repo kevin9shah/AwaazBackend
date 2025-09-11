@@ -1,12 +1,11 @@
 const express = require('express');
+const { exec } = require('child_process');
 const cors = require('cors');
 const { createClient } = require('@supabase/supabase-js');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const pdf2pic = require('pdf2pic');
 const pdfParse = require('pdf-parse');
-const Tesseract = require('tesseract.js');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 require('dotenv').config();
 
@@ -54,63 +53,41 @@ const supabase = createClient(
 
 // Initialize Gemini AI
 const genAI = new GoogleGenerativeAI(process.env.GEMINI_API_KEY);
-const model = genAI.getGenerativeModel({ model: "gemini-1.5-flash" });
+const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
 
 // Generate 5-digit unique code
 function generateUniqueCode() {
   return Math.floor(10000 + Math.random() * 90000).toString();
 }
 
-// Convert PDF to images with better Windows compatibility
+// Convert PDF to images using Python script
 async function convertPdfToImages(pdfPath, outputDir) {
-  try {
-    const convert = pdf2pic.fromPath(pdfPath, {
-      density: 150,           // Lower density for better performance
-      saveFilename: "slide",
-      savePath: outputDir,
-      format: "png",
-      width: 1024,           // Smaller size for better performance
-      height: 768
-    });
-
-    // Try to convert all pages
-    const results = await convert.bulk(-1);
-    return results;
-  } catch (error) {
-    console.error('PDF2PIC Error:', error);
-    
-    // Fallback: try page by page
-    try {
-      console.log('Trying page-by-page conversion...');
-      const convert = pdf2pic.fromPath(pdfPath, {
-        density: 100,
-        saveFilename: "slide",
-        savePath: outputDir,
-        format: "png",
-        width: 800,
-        height: 600
-      });
-
-      // Try converting first 10 pages individually
-      const results = [];
-      for (let i = 1; i <= 10; i++) {
-        try {
-          const result = await convert(i);
-          results.push(result);
-        } catch (pageError) {
-          console.log(`Page ${i} conversion failed, stopping...`);
-          break;
-        }
+  return new Promise((resolve, reject) => {
+    const command = `python test.py "${pdfPath}" "${outputDir}"`;
+    exec(command, (error, stdout, stderr) => {
+      if (error) {
+        console.error(`Error executing python script: ${error}`);
+        return reject(new Error('PDF to image conversion failed.'));
       }
-      return results;
-    } catch (fallbackError) {
-      console.error('Fallback conversion also failed:', fallbackError);
-      throw new Error('PDF to image conversion failed. Please ensure the PDF is valid and not corrupted.');
-    }
-  }
+      if (stderr) {
+        console.error(`Python script stderr: ${stderr}`);
+      }
+      console.log(`Python script stdout: ${stdout}`);
+      
+      // Read the output directory to get the list of images
+      fs.readdir(outputDir, (err, files) => {
+        if (err) {
+          console.error(`Error reading output directory: ${err}`);
+          return reject(new Error('Failed to read output directory.'));
+        }
+        const images = files.map(file => ({ path: path.join(outputDir, file) }));
+        resolve(images);
+      });
+    });
+  });
 }
 
-// Extract text directly from PDF as backup
+// Extract text directly from PDF
 async function extractTextFromPdf(pdfPath) {
   try {
     const dataBuffer = fs.readFileSync(pdfPath);
@@ -133,17 +110,42 @@ async function extractTextFromPdf(pdfPath) {
   }
 }
 
-// Extract text from image using OCR
-async function extractTextFromImage(imagePath) {
-  try {
-    const { data: { text } } = await Tesseract.recognize(imagePath, 'eng', {
-      logger: m => console.log(m)
-    });
-    return text.trim();
-  } catch (error) {
-    console.error('OCR Error:', error);
-    return '';
+// Upload images to Supabase storage
+async function uploadImagesToSupabase(imageResults, uniqueCode) {
+  const uploadedSlides = {};
+  
+  for (let i = 0; i < imageResults.length; i++) {
+    const slideNumber = i + 1;
+    const imagePath = imageResults[i].path;
+    
+    try {
+      console.log(`Uploading slide ${slideNumber} image to Supabase...`);
+      
+      // Upload image to Supabase storage
+      const imageBuffer = fs.readFileSync(imagePath);
+      const fileName = `${uniqueCode}/slide_${slideNumber}.png`;
+      
+      const { error: uploadError } = await supabase.storage
+        .from('presentation-slides')
+        .upload(fileName, imageBuffer, {
+          contentType: 'image/png',
+          upsert: true
+        });
+
+      if (uploadError) {
+        console.error(`Upload error for slide ${slideNumber}:`, uploadError);
+        continue;
+      }
+      
+      uploadedSlides[slideNumber] = true;
+      console.log(`Successfully uploaded slide ${slideNumber}`);
+      
+    } catch (error) {
+      console.error(`Error uploading slide ${slideNumber}:`, error);
+    }
   }
+  
+  return uploadedSlides;
 }
 
 // Generate questions using Gemini
@@ -189,6 +191,65 @@ async function generateSpeechContentWithGemini(slideText, slideNumber) {
   }
 }
 
+// Process PDF text and generate content
+async function processTextContent(pdfPages, uniqueCode) {
+  const slideData = {};
+  const questionsData = {};
+  const speechContent = {};
+  
+  console.log(`Starting to process ${pdfPages.length} pages of text content...`);
+  
+  for (let i = 0; i < pdfPages.length; i++) {
+    const slideNumber = i + 1;
+    const extractedText = pdfPages[i].trim();
+    
+    console.log(`\n--- Processing slide ${slideNumber} ---`);
+    console.log(`Text length: ${extractedText.length} characters`);
+    console.log(`Text preview: "${extractedText.substring(0, 150)}..."`);
+    
+    if (extractedText && extractedText.length > 10) { // Minimum text length check
+      slideData[slideNumber] = extractedText;
+      
+      // Generate questions with Gemini
+      console.log(`Generating questions for slide ${slideNumber}...`);
+      try {
+        const question = await generateQuestionsWithGemini(extractedText, slideNumber);
+        if (question) {
+          questionsData[slideNumber] = [question];
+          console.log(`✓ Question generated for slide ${slideNumber}: "${question.substring(0, 100)}..."`);
+        } else {
+          console.log(`✗ No question generated for slide ${slideNumber}`);
+        }
+      } catch (error) {
+        console.error(`Error generating question for slide ${slideNumber}:`, error);
+      }
+      
+      // Generate speech content with Gemini
+      console.log(`Generating speech content for slide ${slideNumber}...`);
+      try {
+        const speech = await generateSpeechContentWithGemini(extractedText, slideNumber);
+        if (speech) {
+          speechContent[slideNumber] = speech;
+          console.log(`✓ Speech generated for slide ${slideNumber}: "${speech.substring(0, 100)}..."`);
+        } else {
+          console.log(`✗ No speech generated for slide ${slideNumber}`);
+        }
+      } catch (error) {
+        console.error(`Error generating speech for slide ${slideNumber}:`, error);
+      }
+    } else {
+      console.log(`⚠ Skipping slide ${slideNumber} - insufficient text content`);
+    }
+  }
+  
+  console.log(`\n--- Processing Summary ---`);
+  console.log(`Slides with text: ${Object.keys(slideData).length}`);
+  console.log(`Slides with questions: ${Object.keys(questionsData).length}`);
+  console.log(`Slides with speech: ${Object.keys(speechContent).length}`);
+  
+  return { slideData, questionsData, speechContent };
+}
+
 // Upload and process PDF
 app.post('/api/upload-presentation', upload.single('pdf'), async (req, res) => {
   let tempDir = null;
@@ -207,102 +268,38 @@ app.post('/api/upload-presentation', upload.single('pdf'), async (req, res) => {
       fs.mkdirSync(tempDir, { recursive: true });
     }
 
-    // Try to convert PDF to images first
-    let imageResults = [];
-    let useTextFallback = false;
+    // STEP 1: Extract text directly from PDF (always do this)
+    console.log('Extracting text from PDF...');
+    const pdfPages = await extractTextFromPdf(req.file.path);
+    console.log(`Extracted text from ${pdfPages.length} pages`);
+
+    // STEP 2: Process text content (generate questions and speech)
+    console.log('Processing text content and generating AI content...');
+    const { slideData, questionsData, speechContent } = await processTextContent(pdfPages, uniqueCode);
+
+    // STEP 3: Try to convert PDF to images and upload them
+    let hasImages = false;
+    let imageUploadResults = {};
     
     try {
       console.log('Converting PDF to images...');
-      imageResults = await convertPdfToImages(req.file.path, tempDir);
+      const imageResults = await convertPdfToImages(req.file.path, tempDir);
       console.log(`Successfully converted ${imageResults.length} pages to images`);
-    } catch (conversionError) {
-      console.log('Image conversion failed, using text extraction fallback...');
-      useTextFallback = true;
-    }
-
-    const slideData = {};
-    const questionsData = {};
-    const speechContent = {};
-    
-    if (!useTextFallback && imageResults.length > 0) {
-      // Process images and extract text using OCR
-      for (let i = 0; i < imageResults.length; i++) {
-        const slideNumber = i + 1;
-        const imagePath = imageResults[i].path;
-        
-        console.log(`Processing slide ${slideNumber} with image...`);
-        
-        // Upload image to Supabase storage
-        const imageBuffer = fs.readFileSync(imagePath);
-        const fileName = `${uniqueCode}/slide_${slideNumber}.png`;
-        
-        const { error: uploadError } = await supabase.storage
-          .from('presentation-slides')
-          .upload(fileName, imageBuffer, {
-            contentType: 'image/png',
-            upsert: true
-          });
-
-        if (uploadError) {
-          console.error('Upload error:', uploadError);
-          continue;
-        }
-
-        // Extract text using OCR
-        console.log(`Extracting text from slide ${slideNumber} image...`);
-        const extractedText = await extractTextFromImage(imagePath);
-        
-        if (extractedText) {
-          slideData[slideNumber] = extractedText;
-          
-          // Generate questions with Gemini
-          console.log(`Generating questions for slide ${slideNumber}...`);
-          const question = await generateQuestionsWithGemini(extractedText, slideNumber);
-          if (question) {
-            questionsData[slideNumber] = [question];
-          }
-          
-          // Generate speech content with Gemini
-          console.log(`Generating speech content for slide ${slideNumber}...`);
-          const speech = await generateSpeechContentWithGemini(extractedText, slideNumber);
-          if (speech) {
-            speechContent[slideNumber] = speech;
-          }
-        }
-      }
-    } else {
-      // Fallback: Extract text directly from PDF
-      console.log('Using text extraction fallback...');
-      const pdfPages = await extractTextFromPdf(req.file.path);
       
-      for (let i = 0; i < pdfPages.length; i++) {
-        const slideNumber = i + 1;
-        const extractedText = pdfPages[i].trim();
-        
-        console.log(`Processing slide ${slideNumber} with text...`);
-        
-        if (extractedText) {
-          slideData[slideNumber] = extractedText;
-          
-          // Generate questions with Gemini
-          console.log(`Generating questions for slide ${slideNumber}...`);
-          const question = await generateQuestionsWithGemini(extractedText, slideNumber);
-          if (question) {
-            questionsData[slideNumber] = [question];
-          }
-          
-          // Generate speech content with Gemini
-          console.log(`Generating speech content for slide ${slideNumber}...`);
-          const speech = await generateSpeechContentWithGemini(extractedText, slideNumber);
-          if (speech) {
-            speechContent[slideNumber] = speech;
-          }
-        }
-      }
-      imageResults = pdfPages; // Set length for response
+      // Upload images to Supabase
+      console.log('Uploading images to Supabase...');
+      imageUploadResults = await uploadImagesToSupabase(imageResults, uniqueCode);
+      hasImages = Object.keys(imageUploadResults).length > 0;
+      
+      console.log(`Successfully uploaded ${Object.keys(imageUploadResults).length} images`);
+      
+    } catch (conversionError) {
+      console.log('Image conversion failed, continuing without images...');
+      console.error(conversionError.message);
+      hasImages = false;
     }
 
-    const slideCount = useTextFallback ? Object.keys(slideData).length : imageResults.length;
+    const slideCount = pdfPages.length;
 
     // Store in database
     const { error: dbError } = await supabase
@@ -315,7 +312,7 @@ app.post('/api/upload-presentation', upload.single('pdf'), async (req, res) => {
         slide_texts: slideData,
         questions: questionsData,
         speech_content: speechContent,
-        has_images: !useTextFallback,
+        has_images: hasImages,
         created_at: new Date().toISOString()
       });
 
@@ -333,8 +330,11 @@ app.post('/api/upload-presentation', upload.single('pdf'), async (req, res) => {
       success: true,
       code: uniqueCode,
       slideCount: slideCount,
-      hasImages: !useTextFallback,
-      message: useTextFallback ? 'PDF processed with text extraction (images failed)' : 'PDF processed with images'
+      hasImages: hasImages,
+      uploadedImages: Object.keys(imageUploadResults).length,
+      message: hasImages 
+        ? `PDF processed successfully with ${Object.keys(imageUploadResults).length} images uploaded`
+        : 'PDF processed successfully (text only, image conversion failed)'
     });
 
   } catch (error) {
