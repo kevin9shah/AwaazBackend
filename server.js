@@ -20,7 +20,8 @@ const corsOptions = {
     'http://localhost:5174',  // Alternative Vite port
     'http://localhost:5175',  // Alternative Vite port
     'http://127.0.0.1:3000',
-    'http://127.0.0.1:5173'
+    'http://127.0.0.1:5173',
+    'https://awaaz-vr.vercel.app'
   ],
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
